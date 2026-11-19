@@ -4,12 +4,16 @@
 #if !defined(ORT_MINIMAL_BUILD) && !defined(DISABLE_CONTRIB_OPS)
 
 #include <cstdint>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include "gtest/gtest.h"
 
 #include "core/common/inlined_containers.h"
+#include "core/common/logging/severity.h"
+#include "core/providers/webgpu/math/subgroup_matrix_config.h"
 #include "core/providers/webgpu/webgpu_context.h"
 #include "core/providers/webgpu/webgpu_provider_options.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
@@ -92,6 +96,111 @@ void RunFloat16NarrowDP4AAccumulationTest(int64_t bits) {
   test.Config(options).ConfigEp(std::move(provider)).RunWithConfig();
 }
 
+// Runs MatMulNBits with one quantization block per column (block_size == K) and requires the
+// int8 subgroup-matrix kernel to handle it.
+template <typename T>
+void RunPerChannelSubgroupMatrixInt8Test(int64_t bits, int64_t M, int64_t N, int64_t K, bool has_bias) {
+  auto provider = DefaultWebGpuExecutionProvider();
+  if (!provider) {
+    GTEST_SKIP() << "WebGPU execution provider is unavailable.";
+  }
+  const auto& context = webgpu::WebGpuContextFactory::GetContext(provider->GetDeviceId());
+  if (std::is_same_v<T, MLFloat16> && !context.DeviceHasFeature(wgpu::FeatureName::ShaderF16)) {
+    GTEST_SKIP() << "WebGPU adapter does not support shader-f16.";
+  }
+  constexpr auto kI8 = wgpu::SubgroupMatrixComponentType::I8;
+  constexpr auto kI32 = wgpu::SubgroupMatrixComponentType::I32;
+  const auto& adapter = context.AdapterInfo();
+  const auto& device_configs = context.SubgroupMatrixConfigs();
+  const auto config = webgpu::detail::SelectSubgroupMatrixConfigFromAdapterConfigs(
+      {device_configs.configs, device_configs.configCount},
+      adapter.subgroupMinSize, adapter.subgroupMaxSize,
+      context.DeviceHasFeature(wgpu::FeatureName::SubgroupSizeControl),
+      {{kI8, kI32, 8, 16, 32, 32, true}});
+  // The kernel keeps a 64x64 int32 result tile and 64x32 int8 weights in workgroup memory.
+  constexpr uint32_t kWorkgroupStorageSize = 64 * 64 * 4 + 64 * 32;
+  if (!context.DeviceHasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix) || !config.has_value() ||
+      context.DeviceLimits().maxComputeWorkgroupStorageSize < kWorkgroupStorageSize) {
+    GTEST_SKIP() << "Requires the int8 8x16x32 subgroup-matrix configuration.";
+  }
+
+  const int64_t values_per_byte = 8 / bits;
+  const int64_t blob_size = K / values_per_byte;
+  const int32_t zero_point = 1 << (bits - 1);
+  const int64_t quantized_range = int64_t{1} << bits;
+  InlinedVector<int32_t> a_values(static_cast<size_t>(M * K));
+  InlinedVector<int32_t> weights(static_cast<size_t>(N * K));
+  InlinedVector<T> a(static_cast<size_t>(M * K));
+  InlinedVector<uint8_t> packed_weights(static_cast<size_t>(N * blob_size), 0);
+  InlinedVector<T> scales(static_cast<size_t>(N));
+  InlinedVector<T> bias(static_cast<size_t>(N));
+  InlinedVector<T> expected(static_cast<size_t>(M * N));
+
+  // Integer activations with +/-127 in each row have an activation scale of exactly 1, so
+  // quantizing them to int8 is lossless. Row 1 is all zeros and has scale 0.
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t k = 0; k < K; ++k) {
+      int32_t value = static_cast<int32_t>((m * 7 + k * 13) % 253) - 126;
+      if (k == m % K) {
+        value = m % 2 == 0 ? 127 : -127;
+      }
+      if (m == 1) {
+        value = 0;
+      }
+      a_values[m * K + k] = value;
+      a[m * K + k] = T(static_cast<float>(value));
+    }
+  }
+  for (int64_t n = 0; n < N; ++n) {
+    for (int64_t k = 0; k < K; ++k) {
+      const auto quantized = static_cast<int32_t>((n * 5 + k * 3) % quantized_range);
+      weights[n * K + k] = quantized - zero_point;
+      packed_weights[(n * K + k) / values_per_byte] |=
+          static_cast<uint8_t>(quantized << ((k % values_per_byte) * bits));
+    }
+  }
+  // Power-of-two scales keep the expected values exact in FP32.
+  for (int64_t n = 0; n < N; ++n) {
+    const float scale = 1.0f / static_cast<float>(128 << (n % 3));
+    const float bias_value = has_bias ? static_cast<float>(n % 5 - 2) * 0.5f : 0.0f;
+    scales[n] = T(scale);
+    bias[n] = T(bias_value);
+    for (int64_t m = 0; m < M; ++m) {
+      int64_t sum = 0;
+      for (int64_t k = 0; k < K; ++k) {
+        sum += a_values[m * K + k] * weights[n * K + k];
+      }
+      expected[m * N + n] = T(static_cast<float>(sum) * scale + bias_value);
+    }
+  }
+
+  OpTester test("MatMulNBits", 1, kMSDomain);
+  test.AddAttribute<int64_t>("K", K);
+  test.AddAttribute<int64_t>("N", N);
+  test.AddAttribute<int64_t>("bits", bits);
+  test.AddAttribute<int64_t>("block_size", K);
+  test.AddAttribute<int64_t>("accuracy_level", 4);
+  test.AddInput<T>("A", {M, K}, a.data(), a.size());
+  test.AddInput<uint8_t>("B", {N, 1, blob_size}, packed_weights.data(), packed_weights.size(), true);
+  test.AddInput<T>("scales", {N, 1}, scales.data(), scales.size(), true);
+  if (has_bias) {
+    test.AddOptionalInputEdge<uint8_t>();  // zero_points
+    test.AddOptionalInputEdge<int32_t>();  // g_idx
+    test.AddInput<T>("bias", {N}, bias.data(), bias.size(), true);
+  }
+  test.AddOutput<T>("Y", {M, N}, expected.data(), expected.size());
+
+  SessionOptions options;
+  options.use_per_session_threads = false;
+  options.session_log_severity_level = static_cast<int>(logging::Severity::kINFO);
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry(kOrtSessionOptionsDisableCPUEPFallback, "1"));
+  // The dispatch assertion prevents a fallback kernel from hiding failures in the int8 kernel.
+  testing::internal::CaptureStderr();
+  test.Config(options).ConfigEp(std::move(provider)).RunWithConfig();
+  const auto logs = testing::internal::GetCapturedStderr();
+  EXPECT_NE(logs.find("SubgroupMatrixMatMulNBitsInt8"), std::string::npos) << logs;
+}
+
 }  // namespace
 
 TEST(WebGpuMatMulNBitsTest, Float16_Int2_NarrowDP4AAccumulation) {
@@ -104,6 +213,28 @@ TEST(WebGpuMatMulNBitsTest, Float16_Int4_NarrowDP4AAccumulation) {
 
 TEST(WebGpuMatMulNBitsTest, Float16_Int8_NarrowDP4AAccumulation) {
   RunFloat16NarrowDP4AAccumulationTest(8);
+}
+
+// M and N span two workgroup tiles each, with partial last tiles.
+TEST(WebGpuMatMulNBitsTest, Float16_Int8_PerChannelSubgroupMatrixInt8) {
+  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(8, 70, 80, 128, false);
+}
+
+TEST(WebGpuMatMulNBitsTest, Float16_Int4_PerChannelSubgroupMatrixInt8) {
+  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(4, 70, 80, 128, false);
+}
+
+TEST(WebGpuMatMulNBitsTest, Float32_Int8_PerChannelSubgroupMatrixInt8Bias) {
+  RunPerChannelSubgroupMatrixInt8Test<float>(8, 70, 80, 128, true);
+}
+
+// The WebGPU EP accepts a block_size that is not a power of two.
+TEST(WebGpuMatMulNBitsTest, Float16_Int8_PerChannelSubgroupMatrixInt8NonPowerOfTwoK) {
+  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(8, 8, 16, 96, true);
+}
+
+TEST(WebGpuMatMulNBitsTest, Float16_Int4_PerChannelSubgroupMatrixInt8NonPowerOfTwoK) {
+  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(4, 8, 16, 96, true);
 }
 
 }  // namespace test

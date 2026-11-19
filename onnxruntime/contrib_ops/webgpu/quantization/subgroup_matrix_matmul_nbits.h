@@ -25,8 +25,11 @@ class SubgroupMatrixMatMulNBitsProgram final : public Program<SubgroupMatrixMatM
                                    bool has_zero_points, bool has_bias,
                                    bool has_weight_idx, bool has_weight_idx_indirect, bool has_qlora_up,
                                    bool has_tail_buffer)
-      : Program{has_qlora_up ? "SubgroupMatrixMatMulNBitsQLoRAUp"
-                             : (config.subgroupSize == 64 ? "SubgroupMatrixMatMulNBitsWave64" : "SubgroupMatrixMatMulNBits")},
+      : Program{has_qlora_up
+                    ? "SubgroupMatrixMatMulNBitsQLoRAUp"
+                    : (config.componentType == wgpu::SubgroupMatrixComponentType::I8
+                           ? "SubgroupMatrixMatMulNBitsInt8"
+                           : (config.subgroupSize == 64 ? "SubgroupMatrixMatMulNBitsWave64" : "SubgroupMatrixMatMulNBits"))},
         nbits_(nbits),
         config_(config),
         tile_m_(tile_m),
@@ -94,6 +97,9 @@ Status ApplySubgroupMatrixMatMulNBitsQLoRA(
     const SubgroupMatrixConfig& down_config,
     onnxruntime::webgpu::ComputeContext& context, Tensor* t, Tensor* y);
 
+// allow_int8_per_channel lets weights with one scale per column (block_size == K) select the int8
+// kernel. That kernel supports neither zero points, stacked weights nor QLoRA, so only callers
+// without them may set it.
 bool CanApplySubgroupMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
                                        uint64_t accuracy_level,
                                        uint32_t block_size,
@@ -104,7 +110,8 @@ bool CanApplySubgroupMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& cont
                                        bool is_fp16,
                                        std::optional<SubgroupMatrixConfig>& config,
                                        uint32_t M = std::numeric_limits<uint32_t>::max(),
-                                       bool has_weight_idx_indirect = false);
+                                       bool has_weight_idx_indirect = false,
+                                       bool allow_int8_per_channel = false);
 
 }  // namespace webgpu
 }  // namespace contrib
