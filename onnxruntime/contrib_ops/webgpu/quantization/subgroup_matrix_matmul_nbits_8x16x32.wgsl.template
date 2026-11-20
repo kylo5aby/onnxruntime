@@ -12,7 +12,8 @@
 // B: 4-bit or 8-bit quantized, converted to int8 into workgroup memory (tile_b).
 //
 // Each workgroup handles one (M-tile, N-tile) pair. The number of subgroups per workgroup must
-// equal kTileM / sg_mat_m.
+// equal kTileM / sg_mat_m. A dispatch may cover only a range of M-tiles starting at
+// uniforms.m_tile_offset.
 //
 // int8 subgroup matrices are loaded from u32 arrays. Their offsets and strides count u32 words.
 
@@ -21,6 +22,7 @@
 #param sg_mat_k
 #param sg_mat_m
 #param sg_mat_n
+#param tile_k
 #param tile_m
 #param tile_n
 
@@ -39,25 +41,28 @@ const kWordsPerPack : u32 = kElementsPerPack / 4;              // int8 words per
 
 const kTileM : u32 = u32(tile_m);                              // Tile size along M (output rows per workgroup)
 const kTileN : u32 = u32(tile_n);                              // Tile size along N (output columns per workgroup)
+const kTileK : u32 = u32(tile_k);                              // K-elements staged per barrier pair
 const kSgMatDimM : u32 = u32(sg_mat_m);                        // Subgroup matrix M dimension (rows)
 const kSgMatDimN : u32 = u32(sg_mat_n);                        // Subgroup matrix N dimension (columns)
 const kSgMatDimK : u32 = u32(sg_mat_k);                        // Subgroup matrix K dimension (reduction)
-const kPacksPerSgMatK : u32 = kSgMatDimK / kElementsPerPack;   // Packs of one B row per K step
+const kPacksPerTileK : u32 = kTileK / kElementsPerPack;        // Packs of one B row per K step
+const kWordsPerTileK : u32 = kTileK / 4;                       // Words holding kTileK int8 values
 const kWordsPerSgMatK : u32 = kSgMatDimK / 4;                  // Words holding kSgMatDimK int8 values
 const kSgMatLeftWords : u32 = kSgMatDimM * kWordsPerSgMatK;    // Words per left (A) subgroup matrix
-const kSgMatRightWords : u32 = kSgMatDimN * kWordsPerSgMatK;   // Words per right (B) subgroup matrix
 const kSgMatCountM : u32 = kTileM / kSgMatDimM;                // Number of subgroup matrices per tile along M
 const kSgMatCountN : u32 = kTileN / kSgMatDimN;                // Number of subgroup matrices per tile along N
+const kSgMatCountK : u32 = kTileK / kSgMatDimK;                // Subgroup matrix K steps per K step
 
 alias SgMatLeft = subgroup_matrix_left<i8, sg_mat_k, sg_mat_m>;
 alias SgMatRight = subgroup_matrix_right<i8, sg_mat_n, sg_mat_k>;
 alias SgMatResult = subgroup_matrix_result<i32, sg_mat_n, sg_mat_m>;
 
-// Shared local memory for one K step of int8 B weights [kTileN, kSgMatDimK], column-major.
-var<workgroup> tile_b : array<u32, kTileN * kWordsPerSgMatK>;
+// Shared local memory for one K step of int8 B weights [kTileN, kTileK], column-major.
+var<workgroup> tile_b : array<u32, kTileN * kWordsPerTileK>;
 
-// Integer results of the tile [kTileM, kTileN], row-major, scaled at write-out.
-var<workgroup> result_i32 : array<i32, kTileM * kTileN>;
+// Integer results of one subgroup-matrix column of the tile [kTileM, kSgMatDimN], row-major.
+// Writing the tile out one column at a time keeps workgroup memory small, which raises occupancy.
+var<workgroup> result_i32 : array<i32, kTileM * kSgMatDimN>;
 
 // B holds one quantization block per row.
 fn load_b(row : u32, pack_idx : u32) -> PackT {
@@ -78,7 +83,7 @@ fn pack_to_i8(packed : PackT) -> vec2<u32> {
 }
 
 $MAIN {
-  let m_tile = (workgroup_idx / uniforms.num_N_tile) % uniforms.num_M_tile;
+  let m_tile = uniforms.m_tile_offset + (workgroup_idx / uniforms.num_N_tile) % uniforms.num_M_tile;
 
   let global_base_m = m_tile * kTileM;
   let global_base_n = (workgroup_idx % uniforms.num_N_tile) * kTileN;
@@ -89,56 +94,58 @@ $MAIN {
   var sg_mat_offset_a = (m_tile * kSgMatCountM + sg_idx) * (K / kSgMatDimK) * kSgMatLeftWords;
 
   var sg_mat_acc : array<SgMatResult, kSgMatCountN>;
-  for (var k_idx : u32 = 0; k_idx < K; k_idx += kSgMatDimK) {
+  for (var k_idx : u32 = 0; k_idx < K; k_idx += kTileK) {
     let k_pack_idx = k_idx / kElementsPerPack;
-    for (var load_unit = local_idx; load_unit < kTileN * kPacksPerSgMatK; load_unit += workgroup_size_x) {
-      let n_idx = load_unit / kPacksPerSgMatK;
-      let pack_idx = load_unit % kPacksPerSgMatK;
+    for (var load_unit = local_idx; load_unit < kTileN * kPacksPerTileK; load_unit += workgroup_size_x) {
+      let n_idx = load_unit / kPacksPerTileK;
+      let pack_idx = load_unit % kPacksPerTileK;
       let global_n = global_base_n + n_idx;
 
       // Columns beyond N keep stale values. Their results are dropped at write-out.
       if (global_n < uniforms.N) {
         let values = pack_to_i8(load_b(global_n, k_pack_idx + pack_idx));
-        let tile_b_offset = n_idx * kWordsPerSgMatK + pack_idx * kWordsPerPack;
+        let tile_b_offset = n_idx * kWordsPerTileK + pack_idx * kWordsPerPack;
         tile_b[tile_b_offset] = values[0];
         tile_b[tile_b_offset + 1u] = values[1];
       }
     }
     workgroupBarrier();
 
-    var sg_mat_a : SgMatLeft = subgroupMatrixLoad<SgMatLeft, row_major>(&input_a,
-                                                                        sg_mat_offset_a,
-                                                                        kWordsPerSgMatK);
-    sg_mat_offset_a += kSgMatLeftWords;
+    for (var sg_mat_k_idx = 0u; sg_mat_k_idx < kSgMatCountK; sg_mat_k_idx++) {
+      var sg_mat_a : SgMatLeft = subgroupMatrixLoad<SgMatLeft, row_major>(&input_a,
+                                                                          sg_mat_offset_a,
+                                                                          kWordsPerSgMatK);
+      sg_mat_offset_a += kSgMatLeftWords;
 
-    for (var sg_mat_n_idx = 0u; sg_mat_n_idx < kSgMatCountN; sg_mat_n_idx++) {
-      var sg_mat_b : SgMatRight = subgroupMatrixLoad<SgMatRight, col_major>(&tile_b,
-                                                                            sg_mat_n_idx * kSgMatRightWords,
-                                                                            kWordsPerSgMatK);
-      sg_mat_acc[sg_mat_n_idx] = subgroupMatrixMultiplyAccumulate(sg_mat_a, sg_mat_b, sg_mat_acc[sg_mat_n_idx]);
+      for (var sg_mat_n_idx = 0u; sg_mat_n_idx < kSgMatCountN; sg_mat_n_idx++) {
+        var sg_mat_b : SgMatRight = subgroupMatrixLoad<SgMatRight, col_major>(
+            &tile_b, sg_mat_n_idx * kSgMatDimN * kWordsPerTileK + sg_mat_k_idx * kWordsPerSgMatK, kWordsPerTileK);
+        sg_mat_acc[sg_mat_n_idx] = subgroupMatrixMultiplyAccumulate(sg_mat_a, sg_mat_b, sg_mat_acc[sg_mat_n_idx]);
+      }
     }
     workgroupBarrier();
   }
 
-  // Write out
-  let result_store_base = sg_idx * kSgMatDimM * kTileN;
+  // Write out one subgroup-matrix column at a time: each subgroup stores its accumulator for the
+  // column, then the workgroup scales and writes the [kTileM, kSgMatDimN] block.
+  let result_store_base = sg_idx * kSgMatDimM * kSgMatDimN;
   for (var sg_mat_n_idx = 0u; sg_mat_n_idx < kSgMatCountN; sg_mat_n_idx++) {
-    subgroupMatrixStore<row_major>(&result_i32,
-                                   result_store_base + sg_mat_n_idx * kSgMatDimN,
-                                   sg_mat_acc[sg_mat_n_idx],
-                                   kTileN);
-  }
-  workgroupBarrier();
+    if (sg_mat_n_idx > 0u) {
+      workgroupBarrier();  // The previous column has been read out.
+    }
+    subgroupMatrixStore<row_major>(&result_i32, result_store_base, sg_mat_acc[sg_mat_n_idx], kSgMatDimN);
+    workgroupBarrier();
 
-  for (var i = local_idx; i < kTileM * kTileN; i += workgroup_size_x) {
-    let row = global_base_m + i / kTileN;
-    let col = global_base_n + i % kTileN;
-    if (row < uniforms.M && col < uniforms.N) {
-      var value = f32(result_i32[i]) * scales_a[row] * f32(scales_b.getByOffset(col));
+    for (var i = local_idx; i < kTileM * kSgMatDimN; i += workgroup_size_x) {
+      let row = global_base_m + i / kSgMatDimN;
+      let col = global_base_n + sg_mat_n_idx * kSgMatDimN + i % kSgMatDimN;
+      if (row < uniforms.M && col < uniforms.N) {
+        var value = f32(result_i32[i]) * scales_a[row] * f32(scales_b.getByOffset(col));
 #if has_bias
-      value += f32(bias[col]);
+        value += f32(bias[col]);
 #endif
-      output.setByOffset(row * uniforms.N + col, output_element_t(value));
+        output.setByOffset(row * uniforms.N + col, output_element_t(value));
+      }
     }
   }
 }  // MAIN

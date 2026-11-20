@@ -49,7 +49,8 @@ class SubgroupMatrixMatMulNBitsProgram final : public Program<SubgroupMatrixMatM
       {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32},
       {"num_N_tile", ProgramUniformVariableDataType::Uint32},
       {"num_M_tile", ProgramUniformVariableDataType::Uint32},
-      {"weight_idx", ProgramUniformVariableDataType::Uint32});
+      {"weight_idx", ProgramUniformVariableDataType::Uint32},
+      {"m_tile_offset", ProgramUniformVariableDataType::Uint32});
 
  private:
   uint32_t nbits_;

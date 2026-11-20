@@ -153,13 +153,14 @@ Status GenerateShaderCode8x16x32(ShaderHelper& shader,
                                  const ShaderVariableHelper& scales_b,
                                  const ShaderVariableHelper& output,
                                  uint32_t nbits, const SubgroupMatrixConfig& config, bool has_bias,
-                                 uint32_t tile_m, uint32_t tile_n) {
+                                 uint32_t tile_m, uint32_t tile_n, uint32_t tile_k) {
   return WGSL_TEMPLATE_APPLY(shader, "quantization/subgroup_matrix_matmul_nbits_8x16x32.wgsl.template",
                              WGSL_TEMPLATE_PARAMETER(has_bias, has_bias),
                              WGSL_TEMPLATE_PARAMETER(n_bits, nbits),
                              WGSL_TEMPLATE_PARAMETER(sg_mat_k, config.K),
                              WGSL_TEMPLATE_PARAMETER(sg_mat_m, config.M),
                              WGSL_TEMPLATE_PARAMETER(sg_mat_n, config.N),
+                             WGSL_TEMPLATE_PARAMETER(tile_k, tile_k),
                              WGSL_TEMPLATE_PARAMETER(tile_m, tile_m),
                              WGSL_TEMPLATE_PARAMETER(tile_n, tile_n),
                              WGSL_TEMPLATE_VARIABLE(input_b, b),
@@ -223,7 +224,8 @@ Status SubgroupMatrixMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader
                                      has_weight_idx_, has_weight_idx_indirect_, has_qlora_up_, tile_m_, tile_n_,
                                      has_tail_buffer_, lora_t);
   } else if (config_.Is(8, 16, 32)) {
-    return GenerateShaderCode8x16x32(shader, b, scales_b, output, nbits_, config_, has_bias_, tile_m_, tile_n_);
+    return GenerateShaderCode8x16x32(shader, b, scales_b, output, nbits_, config_, has_bias_, tile_m_, tile_n_,
+                                     tile_k_);
   } else if (config_.Is(16, 16, 16)) {
     return GenerateShaderCode16x16x16(shader, b, scales_b, output, nbits_, config_, tile_m_,
                                       tile_n_, tile_k_,
@@ -263,15 +265,23 @@ struct MatMulNBitsTiling {
   uint32_t workgroup_size;
 };
 
-// Workgroup tile of the int8 8x16x32 kernel.
+// Workgroup tile of the int8 8x16x32 kernel. Staging 64 K-elements of B per barrier pair halves the per-step
+// overhead of a 32-element step.
 constexpr uint32_t kInt8TileM = 64;
 constexpr uint32_t kInt8TileN = 64;
-constexpr uint32_t kInt8TileK = 32;
-// The int8 kernel keeps one K step of int8 B weights and the tile's int32 results in workgroup memory.
+constexpr uint32_t kInt8TileK = 64;
+constexpr uint32_t kInt8SgMatN = 16;
+// The int8 kernel keeps one K step of int8 B weights and one subgroup-matrix column of int32 results in
+// workgroup memory. Keeping this small matters: occupancy is bound by workgroup memory.
 constexpr uint32_t kInt8WorkgroupStorageSize =
-    kInt8TileN * kInt8TileK + kInt8TileM * kInt8TileN * static_cast<uint32_t>(sizeof(int32_t));
+    kInt8TileN * kInt8TileK + kInt8TileM * kInt8SgMatN * static_cast<uint32_t>(sizeof(int32_t));
 // An int32 accumulator sums K products of magnitude at most 127 * 128, which cannot overflow up to this K.
 constexpr uint32_t kInt8MaxK = 131072;
+// Workgroups sharing an N-tile run close together, so the whole int8 A of a dispatch is re-read once per N-tile.
+// Large-M inputs are split into dispatches over even ranges of M-tiles whose A stays within this size, so the
+// re-reads hit the cache. Each extra dispatch has a fixed cost, so the bound is not set lower than needed.
+// Measured on Intel Arc B390 (Vulkan) for K = 3840 and 10240.
+constexpr uint64_t kInt8MaxSegmentABytes = 12'000'000;
 
 MatMulNBitsTiling SelectMatMulNBitsTiling(const SubgroupMatrixConfig& config,
                                           uint32_t M, uint32_t N, uint32_t K, bool has_bias) {
@@ -444,56 +454,70 @@ Status ApplySubgroupMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Te
   const bool has_tail_buffer = !has_bias && config.Is(8, 16, 16) &&
                                config.resultComponentType != wgpu::SubgroupMatrixComponentType::F32 &&
                                (M % tile_m != 0);
-  SubgroupMatrixMatMulNBitsProgram matmul_program{nbits, config, tile_m, tile_n, tile_size_k,
-                                                  has_zero_points, has_bias, has_weight_idx,
-                                                  has_weight_idx_indirect, has_qlora_up, has_tail_buffer};
-  matmul_program.SetWorkgroupSize(workgroup_size);
-
-  // Pin kernels running on variable-size adapters to the subgroup size they were written for.
-  if (context.HasFeature(wgpu::FeatureName::SubgroupSizeControl)) {
-    matmul_program.SetSubgroupSize(config.subgroupSize);
-  }
-
-  uint32_t num_N_tile = CeilDiv(N, tile_n);
-  uint32_t num_M_tile = CeilDiv(M, tile_m);
-  matmul_program.SetDispatchGroupSize(num_N_tile, num_M_tile, 1);
-
-  const int input_b_components = static_cast<int>(nbits == 4 ? kU32Components : 2 * kU32Components);
-  matmul_program.AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, 1},
-                            {b, ProgramTensorMetadataDependency::TypeAndRank, input_b_components},
-                            {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
-      .AddUniformVariables({{M}, {N}, {K}, {zero_blocks_per_col}, {num_N_tile}, {num_M_tile}, {weight_index}})
-      .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, y_shape, 1})
-      .CacheHint(nbits,
-                 static_cast<uint32_t>(config.componentType),
-                 static_cast<uint32_t>(config.resultComponentType),
-                 config.M, config.N, config.K, config.subgroupSize,
-                 tile_m, tile_n, tile_size_k, has_zero_points, has_bias, has_weight_idx,
-                 has_weight_idx_indirect, has_qlora_up, has_tail_buffer);
-  if (has_zero_points) {
-    matmul_program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
-  }
-  if (bias) {
-    matmul_program.AddInput({bias, ProgramTensorMetadataDependency::None});
-  }
-  if (has_weight_idx_indirect) {
-    matmul_program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
-  }
-  if (has_qlora_up) {
-    matmul_program.AddInput({lora_t, ProgramTensorMetadataDependency::Type, 4});
-    matmul_program.AddInput({lora_b, ProgramTensorMetadataDependency::Type, 16});
-    matmul_program.AddInput({lora_b_scales, ProgramTensorMetadataDependency::Type});
-  }
-  if (is_int8) {
-    matmul_program.AddInput({&a_scales, ProgramTensorMetadataDependency::None});
-  }
-
+  const uint32_t num_N_tile = CeilDiv(N, tile_n);
+  const uint32_t num_M_tile = CeilDiv(M, tile_m);
   Tensor tail_buffer;
   if (has_tail_buffer) {
     tail_buffer = context.CreateGPUTensor(y->DataType(), TensorShape{tile_m, N});
-    matmul_program.AddOutput({&tail_buffer, ProgramTensorMetadataDependency::None});
   }
-  ORT_RETURN_IF_ERROR(context.RunProgram(matmul_program));
+  // The int8 kernel splits large M into even ranges of M-tiles (see kInt8MaxSegmentABytes).
+  uint32_t num_segments = 1;
+  if (is_int8) {
+    const uint64_t max_segment_m_tiles = std::max<uint64_t>(1, kInt8MaxSegmentABytes / (uint64_t{tile_m} * K));
+    num_segments = static_cast<uint32_t>(CeilDiv(uint64_t{num_M_tile}, max_segment_m_tiles));
+  }
+  const uint32_t m_tiles_per_segment = CeilDiv(num_M_tile, num_segments);
+  auto run_matmul = [&](uint32_t m_tile_offset, uint32_t segment_m_tiles) -> Status {
+    SubgroupMatrixMatMulNBitsProgram matmul_program{nbits, config, tile_m, tile_n, tile_size_k,
+                                                    has_zero_points, has_bias, has_weight_idx,
+                                                    has_weight_idx_indirect, has_qlora_up, has_tail_buffer};
+    matmul_program.SetWorkgroupSize(workgroup_size);
+
+    // Pin kernels running on variable-size adapters to the subgroup size they were written for.
+    if (context.HasFeature(wgpu::FeatureName::SubgroupSizeControl)) {
+      matmul_program.SetSubgroupSize(config.subgroupSize);
+    }
+
+    matmul_program.SetDispatchGroupSize(num_N_tile, segment_m_tiles, 1);
+
+    const int input_b_components = static_cast<int>(nbits == 4 ? kU32Components : 2 * kU32Components);
+    matmul_program.AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, 1},
+                              {b, ProgramTensorMetadataDependency::TypeAndRank, input_b_components},
+                              {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
+        .AddUniformVariables({{M}, {N}, {K}, {zero_blocks_per_col}, {num_N_tile}, {segment_m_tiles}, {weight_index}, {m_tile_offset}})
+        .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, y_shape, 1})
+        .CacheHint(nbits,
+                   static_cast<uint32_t>(config.componentType),
+                   static_cast<uint32_t>(config.resultComponentType),
+                   config.M, config.N, config.K, config.subgroupSize,
+                   tile_m, tile_n, tile_size_k, has_zero_points, has_bias, has_weight_idx,
+                   has_weight_idx_indirect, has_qlora_up, has_tail_buffer);
+    if (has_zero_points) {
+      matmul_program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
+    }
+    if (bias) {
+      matmul_program.AddInput({bias, ProgramTensorMetadataDependency::None});
+    }
+    if (has_weight_idx_indirect) {
+      matmul_program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
+    }
+    if (has_qlora_up) {
+      matmul_program.AddInput({lora_t, ProgramTensorMetadataDependency::Type, 4});
+      matmul_program.AddInput({lora_b, ProgramTensorMetadataDependency::Type, 16});
+      matmul_program.AddInput({lora_b_scales, ProgramTensorMetadataDependency::Type});
+    }
+    if (is_int8) {
+      matmul_program.AddInput({&a_scales, ProgramTensorMetadataDependency::None});
+    }
+
+    if (has_tail_buffer) {
+      matmul_program.AddOutput({&tail_buffer, ProgramTensorMetadataDependency::None});
+    }
+    return context.RunProgram(matmul_program);
+  };
+  for (uint32_t m_tile_offset = 0; m_tile_offset < num_M_tile; m_tile_offset += m_tiles_per_segment) {
+    ORT_RETURN_IF_ERROR(run_matmul(m_tile_offset, std::min(m_tiles_per_segment, num_M_tile - m_tile_offset)));
+  }
 
   if (has_tail_buffer) {
     // Only the rows below `tail_rows` in `tail_buffer` were ever written by the
@@ -590,7 +614,8 @@ bool CanApplySubgroupMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& cont
 
   if (int8_per_channel) {
     // The kernel quantizes A to int8, which matches accuracy level 4 only.
-    if (accuracy_level != 4 || K > kInt8MaxK ||
+    // The K loop does not mask a partial K step.
+    if (accuracy_level != 4 || K % kInt8TileK != 0 || K > kInt8MaxK ||
         context.DeviceLimits().maxComputeWorkgroupStorageSize < kInt8WorkgroupStorageSize) {
       return false;
     }

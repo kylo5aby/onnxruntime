@@ -4,6 +4,7 @@
 #if !defined(ORT_MINIMAL_BUILD) && !defined(DISABLE_CONTRIB_OPS)
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -96,10 +97,13 @@ void RunFloat16NarrowDP4AAccumulationTest(int64_t bits) {
   test.Config(options).ConfigEp(std::move(provider)).RunWithConfig();
 }
 
-// Runs MatMulNBits with one quantization block per column (block_size == K) and requires the
-// int8 subgroup-matrix kernel to handle it.
+// Runs MatMulNBits with one quantization block per column (block_size == K) and checks whether the
+// int8 subgroup-matrix kernel handles it. Each entry of expected_dispatches must appear in the logged
+// dispatch sizes, e.g. "(1, 7, 1)".
 template <typename T>
-void RunPerChannelSubgroupMatrixInt8Test(int64_t bits, int64_t M, int64_t N, int64_t K, bool has_bias) {
+void RunPerChannelSubgroupMatrixInt8Test(int64_t bits, int64_t M, int64_t N, int64_t K, bool has_bias,
+                                         bool expect_int8 = true,
+                                         std::initializer_list<std::string_view> expected_dispatches = {}) {
   auto provider = DefaultWebGpuExecutionProvider();
   if (!provider) {
     GTEST_SKIP() << "WebGPU execution provider is unavailable.";
@@ -117,8 +121,8 @@ void RunPerChannelSubgroupMatrixInt8Test(int64_t bits, int64_t M, int64_t N, int
       adapter.subgroupMinSize, adapter.subgroupMaxSize,
       context.DeviceHasFeature(wgpu::FeatureName::SubgroupSizeControl),
       {{kI8, kI32, 8, 16, 32, 32, true}});
-  // The kernel keeps a 64x64 int32 result tile and 64x32 int8 weights in workgroup memory.
-  constexpr uint32_t kWorkgroupStorageSize = 64 * 64 * 4 + 64 * 32;
+  // The kernel keeps a 64x16 int32 result column and 64x64 int8 weights in workgroup memory.
+  constexpr uint32_t kWorkgroupStorageSize = 64 * 16 * 4 + 64 * 64;
   if (!context.DeviceHasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix) || !config.has_value() ||
       context.DeviceLimits().maxComputeWorkgroupStorageSize < kWorkgroupStorageSize) {
     GTEST_SKIP() << "Requires the int8 8x16x32 subgroup-matrix configuration.";
@@ -198,7 +202,14 @@ void RunPerChannelSubgroupMatrixInt8Test(int64_t bits, int64_t M, int64_t N, int
   testing::internal::CaptureStderr();
   test.Config(options).ConfigEp(std::move(provider)).RunWithConfig();
   const auto logs = testing::internal::GetCapturedStderr();
-  EXPECT_NE(logs.find("SubgroupMatrixMatMulNBitsInt8"), std::string::npos) << logs;
+  if (expect_int8) {
+    EXPECT_NE(logs.find("SubgroupMatrixMatMulNBitsInt8"), std::string::npos) << logs;
+  } else {
+    EXPECT_EQ(logs.find("SubgroupMatrixMatMulNBitsInt8"), std::string::npos) << logs;
+  }
+  for (std::string_view dispatch : expected_dispatches) {
+    EXPECT_NE(logs.find(dispatch), std::string::npos) << dispatch << ' ' << logs;
+  }
 }
 
 }  // namespace
@@ -230,11 +241,22 @@ TEST(WebGpuMatMulNBitsTest, Float32_Int8_PerChannelSubgroupMatrixInt8Bias) {
 
 // The WebGPU EP accepts a block_size that is not a power of two.
 TEST(WebGpuMatMulNBitsTest, Float16_Int8_PerChannelSubgroupMatrixInt8NonPowerOfTwoK) {
-  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(8, 8, 16, 96, true);
+  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(8, 8, 16, 192, true);
 }
 
 TEST(WebGpuMatMulNBitsTest, Float16_Int4_PerChannelSubgroupMatrixInt8NonPowerOfTwoK) {
-  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(4, 8, 16, 96, true);
+  RunPerChannelSubgroupMatrixInt8Test<MLFloat16>(4, 8, 16, 192, true);
+}
+
+// The int8 kernel steps K by 64, so other K fall back to another kernel.
+TEST(WebGpuMatMulNBitsTest, Float32_Int8_PerChannelKNotMultipleOf64Fallback) {
+  RunPerChannelSubgroupMatrixInt8Test<float>(8, 8, 16, 96, false, /*expect_int8=*/false);
+}
+
+// The int8 A of 64 x 16384 bytes per M-tile splits 13 M-tiles into dispatches of 7 and 6 M-tiles.
+TEST(WebGpuMatMulNBitsTest, Float32_Int8_PerChannelSubgroupMatrixInt8Segmented) {
+  RunPerChannelSubgroupMatrixInt8Test<float>(8, 773, 48, 16384, false, /*expect_int8=*/true,
+                                             {"(1, 7, 1)", "(1, 6, 1)"});
 }
 
 }  // namespace test
