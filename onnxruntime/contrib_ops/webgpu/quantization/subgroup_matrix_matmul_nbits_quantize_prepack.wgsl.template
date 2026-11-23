@@ -1,0 +1,60 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// SubgroupMatrix int8 quantize and prepack kernel
+// Quantizes input matrix A(MxK) to int8 with one scale per row, and stores it in the layout of
+// the prepack kernel: each subgroup matrix (sg_mat_m x sg_mat_k) is contiguous and row-major.
+// Four int8 values are packed per u32.
+//
+// One workgroup handles one row of A. Rows >= M of the padded output are not written, so
+// downstream shaders must not rely on them.
+
+#param sg_mat_k
+#param sg_mat_m
+
+#use .getByOffset .setByOffset
+
+const kSgMatM : u32 = u32(sg_mat_m);
+const kSgMatK : u32 = u32(sg_mat_k);
+const kWordsPerSgMatRow : u32 = kSgMatK / 4;
+const kWordsPerSgMat : u32 = kSgMatM * kWordsPerSgMatRow;
+
+var<workgroup> partial_max : array<f32, workgroup_size_x>;
+
+$MAIN {
+  let row = workgroup_idx;
+  // The dispatch may be padded beyond M.
+  if (row >= uniforms.M) {
+    return;
+  }
+
+  let words_per_row = uniforms.K / 4;
+  let in_offset = row * words_per_row;
+
+  var local_max = 0.0;
+  for (var w = local_idx; w < words_per_row; w += workgroup_size_x) {
+    let abs_a = abs(vec4<f32>(input_a.getByOffset(in_offset + w)));
+    local_max = max(local_max, max(max(abs_a.x, abs_a.y), max(abs_a.z, abs_a.w)));
+  }
+  partial_max[local_idx] = local_max;
+  workgroupBarrier();
+
+  var row_max = 0.0;
+  for (var i = 0u; i < workgroup_size_x; i++) {
+    row_max = max(row_max, partial_max[i]);
+  }
+  // An all-zero row quantizes to zeros with scale 0.
+  let divisor = select(row_max, 1.0, row_max == 0.0);
+
+  let out_offset = (row / kSgMatM) * (uniforms.K / kSgMatK) * kWordsPerSgMat + (row % kSgMatM) * kWordsPerSgMatRow;
+  for (var w = local_idx; w < words_per_row; w += workgroup_size_x) {
+    let a = vec4<f32>(input_a.getByOffset(in_offset + w));
+    let sg_mat_offset = (w / kWordsPerSgMatRow) * kWordsPerSgMat + w % kWordsPerSgMatRow;
+    output_a.setByOffset(out_offset + sg_mat_offset, pack4x8snorm(a / divisor));
+  }
+
+  if (local_idx == 0u) {
+    // pack4x8snorm maps 1.0 to 127.
+    scales_a.setByOffset(row, row_max / 127.0);
+  }
+}  // MAIN

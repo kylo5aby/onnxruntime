@@ -366,11 +366,13 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales, 
 
   // apple|intel - Experimental dawn support for subgroup matrix matmul.
   std::optional<SubgroupMatrixConfig> subgroup_matrix_config;
+  const bool allow_int8_per_channel = !has_zero_points && !has_weight_idx && !has_qlora_up;
   if (!has_qlora_down &&
       CanApplySubgroupMatrixMatMulNBits(context, accuracy_level, block_size, batch_count, N, K,
                                         static_cast<uint32_t>(nbits),
                                         y->DataType() == DataTypeImpl::GetType<MLFloat16>(),
-                                        subgroup_matrix_config, M, has_weight_idx_indirect)) {
+                                        subgroup_matrix_config, M, has_weight_idx_indirect,
+                                        allow_int8_per_channel)) {
     return ApplySubgroupMatrixMatMulNBits(a, b, scales, zero_points, bias, M, N, K, static_cast<uint32_t>(nbits),
                                           zero_blocks_per_col, *subgroup_matrix_config, context, y, weight_index,
                                           weight_index_indirect, nullptr, lora_t, lora_b, lora_b_scales);
